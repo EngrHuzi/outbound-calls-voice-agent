@@ -1,3 +1,10 @@
+"""
+LiveKit Agent Worker with MCP Tool Integration
+
+This module implements a voice agent worker that connects to LiveKit rooms
+and uses tools from a custom MCP server for enhanced capabilities.
+"""
+
 import os
 import asyncio
 import logging
@@ -10,8 +17,11 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     vad,
+    voice,
+    llm,
 )
 from livekit.plugins import deepgram, cartesia, silero
+from livekit.agents.llm.mcp import MCPServerStdio
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -51,45 +61,6 @@ class AgentConfig:
         )
 
 
-class SimpleVoiceAgent:
-    """Simple voice agent that manually handles the conversation flow."""
-
-    def __init__(self, config: AgentConfig, system_prompt: str, model: str = "llama-3.3-70b-versatile"):
-        self.config = config
-        self.system_prompt = system_prompt
-        self.model = model
-        self.groq_client = AsyncOpenAI(
-            api_key=config.groq_api_key,
-            base_url="https://api.groq.com/openai/v1"
-        )
-        self.conversation_history = [{"role": "system", "content": system_prompt}]
-
-    async def get_response(self, user_message: str) -> str:
-        """Get response from Groq LLM."""
-        try:
-            # Add user message to conversation history
-            self.conversation_history.append({"role": "user", "content": user_message})
-
-            # Get response from Groq
-            response = await self.groq_client.chat.completions.create(
-                model=self.model,
-                messages=self.conversation_history,
-                temperature=0.7,
-                max_tokens=1024
-            )
-
-            assistant_message = response.choices[0].message.content
-
-            # Add assistant response to conversation history
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
-
-            return assistant_message
-
-        except Exception as e:
-            logger.error(f"Error getting Groq response: {e}")
-            return "I apologize, I'm having trouble processing that right now."
-
-
 def prewarm(proc):
     """Prewarm the agent process to load models into memory."""
     logger.info("Prewarming agent process...")
@@ -101,8 +72,43 @@ def prewarm(proc):
         logger.warning(f"Prewarming failed: {e}")
 
 
+async def setup_mcp_tools() -> list:
+    """
+    Connect to the custom MCP server and load available tools.
+
+    Returns:
+        List of MCP tools that can be used by the voice agent.
+    """
+    try:
+        # Create MCP server connection using stdio transport
+        mcp_server = MCPServerStdio(
+            command="uv",
+            args=["run", "python", "mcp_server.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            client_session_timeout_seconds=30
+        )
+
+        # Initialize the MCP server connection
+        await mcp_server.initialize()
+        logger.info("MCP server initialized successfully")
+
+        # List available tools from the MCP server
+        tools = await mcp_server.list_tools()
+        logger.info(f"Loaded {len(tools)} tools from MCP server")
+
+        for tool in tools:
+            if hasattr(tool, '_raw_schema'):
+                logger.info(f"  - {tool._raw_schema.get('name', 'unknown')}")
+
+        return tools
+
+    except Exception as e:
+        logger.error(f"Failed to setup MCP tools: {e}", exc_info=True)
+        return []
+
+
 async def appointment_entrypoint(ctx: JobContext):
-    """Entry point for appointment reminder agent."""
+    """Entry point for appointment reminder agent with MCP tools."""
     try:
         logger.info(f"Starting appointment reminder agent in room: {ctx.room.name}")
 
@@ -128,68 +134,30 @@ async def appointment_entrypoint(ctx: JobContext):
             voice="alicia"
         )
 
-        # Create Groq client
-        groq_client = AsyncOpenAI(
-            api_key=config.groq_api_key,
-            base_url="https://api.groq.com/openai/v1"
-        )
+        # Setup MCP tools
+        mcp_tools = await setup_mcp_tools()
 
-        # Import and use Voice Agent Session
-        from livekit.agents import voice, llm
-
-        # Create a custom LLM adapter for Groq
-        class GroqLLMAdapter:
-            def __init__(self, client, model):
-                self.client = client
-                self.model = model
-
-            async def chat(self, chat_ctx, tools=None):
-                """Process chat with Groq API."""
-                messages = []
-                for msg in chat_ctx.messages:
-                    if hasattr(msg, 'role'):
-                        messages.append({
-                            "role": msg.role,
-                            "content": msg.content if hasattr(msg, 'content') else str(msg)
-                        })
-
-                try:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=1024
-                    )
-                    return llm.ChatMessage(
-                        role="assistant",
-                        content=response.choices[0].message.content
-                    )
-                except Exception as e:
-                    logger.error(f"Error in Groq LLM: {e}")
-                    return llm.ChatMessage(
-                        role="assistant",
-                        content="I apologize, I'm having trouble processing that right now."
-                    )
-
-        # Create Groq LLM adapter
-        groq_llm = GroqLLMAdapter(groq_client, "llama-3.3-70b-versatile")
-
-        # Create voice agent session
+        # Create voice agent session with MCP tools
         session = voice.AgentSession(
             stt=stt,
-            llm=groq_llm,
+            llm=llm.openai.LLM(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=config.groq_api_key,
+                model="llama-3.3-70b-versatile"
+            ),
             tts=tts,
         )
 
-        # Start the session
+        # Start the session with tools
         await session.start(
             room=ctx.room,
             agent=voice.Agent(
                 instructions=APPOINTMENT_REMINDER_PROMPT,
+                tools=mcp_tools if mcp_tools else [],
             ),
         )
 
-        logger.info("Voice agent started successfully")
+        logger.info("Voice agent started successfully with MCP tools")
 
     except Exception as e:
         logger.error(f"Error in appointment_entrypoint: {e}", exc_info=True)
@@ -197,7 +165,7 @@ async def appointment_entrypoint(ctx: JobContext):
 
 
 async def lead_qualification_entrypoint(ctx: JobContext):
-    """Entry point for lead qualification agent."""
+    """Entry point for lead qualification agent with MCP tools."""
     try:
         logger.info(f"Starting lead qualification agent in room: {ctx.room.name}")
 
@@ -223,68 +191,30 @@ async def lead_qualification_entrypoint(ctx: JobContext):
             voice="alicia"
         )
 
-        # Create Groq client
-        groq_client = AsyncOpenAI(
-            api_key=config.groq_api_key,
-            base_url="https://api.groq.com/openai/v1"
-        )
+        # Setup MCP tools
+        mcp_tools = await setup_mcp_tools()
 
-        # Import and use Voice Agent Session
-        from livekit.agents import voice, llm
-
-        # Create a custom LLM adapter for Groq
-        class GroqLLMAdapter:
-            def __init__(self, client, model):
-                self.client = client
-                self.model = model
-
-            async def chat(self, chat_ctx, tools=None):
-                """Process chat with Groq API."""
-                messages = []
-                for msg in chat_ctx.messages:
-                    if hasattr(msg, 'role'):
-                        messages.append({
-                            "role": msg.role,
-                            "content": msg.content if hasattr(msg, 'content') else str(msg)
-                        })
-
-                try:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=1024
-                    )
-                    return llm.ChatMessage(
-                        role="assistant",
-                        content=response.choices[0].message.content
-                    )
-                except Exception as e:
-                    logger.error(f"Error in Groq LLM: {e}")
-                    return llm.ChatMessage(
-                        role="assistant",
-                        content="I apologize, I'm having trouble processing that right now."
-                    )
-
-        # Create Groq LLM adapter
-        groq_llm = GroqLLMAdapter(groq_client, "mixtral-8x7b-32768")
-
-        # Create voice agent session
+        # Create voice agent session with MCP tools
         session = voice.AgentSession(
             stt=stt,
-            llm=groq_llm,
+            llm=llm.openai.LLM(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=config.groq_api_key,
+                model="mixtral-8x7b-32768"
+            ),
             tts=tts,
         )
 
-        # Start the session
+        # Start the session with tools
         await session.start(
             room=ctx.room,
             agent=voice.Agent(
                 instructions=LEAD_QUALIFICATION_PROMPT,
+                tools=mcp_tools if mcp_tools else [],
             ),
         )
 
-        logger.info("Voice agent started successfully")
+        logger.info("Voice agent started successfully with MCP tools")
 
     except Exception as e:
         logger.error(f"Error in lead_qualification_entrypoint: {e}", exc_info=True)
@@ -310,9 +240,9 @@ def main():
             logger.error("Please set these in your .env file")
             return
 
-        logger.info("Starting LiveKit agent worker...")
+        logger.info("Starting LiveKit agent worker with MCP tool support...")
 
-        # Start the worker with both entrypoints
+        # Start the worker with appointment entrypoint (can be changed to lead_qualification_entrypoint)
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=appointment_entrypoint,
